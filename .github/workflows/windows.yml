@@ -1,0 +1,181 @@
+# JayPlay for Windows, built and proven on a real Windows machine in the public repository
+# Narikia1/jayplay-apps. It builds a given commit of the private Narikia1/jayplay (read with a read-only
+# deploy key), installs the result, runs it, and uploads the installer and the evidence. It publishes nothing.
+name: Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit of Narikia1/jayplay to build
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: 1
+      DOTNET_NOLOGO: 1
+      AVALONIA_TELEMETRY_OPTOUT: 1
+      EVIDENCE: ${{ github.workspace }}\evidence
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Narikia1/jayplay
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.JAYPLAY_SOURCE_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Generated files are current, and nothing is hardcoded
+        run: |
+          node scripts/generate.mjs --check
+          node scripts/check-hygiene.mjs
+        continue-on-error: true
+
+      - name: Unit tests
+        run: dotnet test apps/windows/JayPlay.Tests/JayPlay.Tests.csproj -c Release
+
+      - name: Publish
+        run: dotnet publish apps/windows/JayPlay/JayPlay.csproj -r win-x64 -c Release --self-contained
+
+      - name: Keep a copy of libmpv, because its release expires after about a month
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/libmpv-pin
+          key: libmpv-${{ hashFiles('apps/windows/scripts/fetch-libmpv.mjs') }}
+
+      - name: Fetch the pinned LGPL libmpv
+        shell: pwsh
+        run: |
+          node apps/windows/scripts/fetch-libmpv.mjs --out dist/windows/publish --cache "$env:RUNNER_TEMP\libmpv-pin"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path dist/windows/publish/libmpv-2.dll)) { throw 'libmpv-2.dll was not fetched' }
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          node apps/windows/scripts/generate-installer.mjs
+          $iscc = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe" | Select-Object -First 1
+          & $iscc.FullName apps\windows\installer\jayplay.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Item dist\windows\JayPlay-Setup.exe | Format-List FullName, Length
+
+      - name: Make sample files with ffmpeg
+        shell: pwsh
+        run: |
+          choco install ffmpeg -y --no-progress
+          New-Item -ItemType Directory -Force -Path samples, $env:EVIDENCE | Out-Null
+          ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=120" -f lavfi -i "sine=frequency=330:sample_rate=48000:duration=120" -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest samples\first.mp4
+          ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=640x360:rate=25:duration=60" -f lavfi -i "sine=frequency=550:sample_rate=48000:duration=60" -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest samples\second.mp4
+          ffmpeg -hide_banner -loglevel error -y -f lavfi -i "anoisesrc=color=pink:amplitude=0.15:sample_rate=48000:duration=4" -f lavfi -i "anoisesrc=color=white:amplitude=0.05:sample_rate=48000:duration=4" -f lavfi -i "anullsrc=channel_layout=stereo:sample_rate=48000:duration=2" -filter_complex "[0][1]join=inputs=2:channel_layout=stereo[n];[n][2]concat=n=2:v=0:a=1,aloop=loop=1:size=288000[out]" -map "[out]" samples\noise.flac
+
+      - name: What this libmpv really contains and does (filters, decoders, thumbnails)
+        id: engine
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath dist\windows\publish\JayPlay.exe -ArgumentList '--engine-check', "$PWD\samples\noise.flac", "$PWD\samples\first.mp4", "$env:EVIDENCE\engine-check.json" -Wait -PassThru
+          $report = Get-Content "$env:EVIDENCE\engine-check.json" -Raw | ConvertFrom-Json
+          Write-Host "mpv $($report.mpv), FFmpeg $($report.ffmpeg). Decoders: $($report.decoders.Count). Demuxers: $($report.demuxers.Count). Passed: $($report.passed)"
+          $report.failures | ForEach-Object { Write-Host "FAILED: $_" }
+          if ($proc.ExitCode -ne 0) { exit 1 }
+
+      - name: Install silently, for this user only
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath dist\windows\JayPlay-Setup.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS=associate' -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { exit $proc.ExitCode }
+          $exe = "$env:LOCALAPPDATA\Programs\JayPlay\JayPlay.exe"
+          if (-not (Test-Path $exe)) { throw "Not installed at $exe" }
+          if (-not (Test-Path "$env:LOCALAPPDATA\Programs\JayPlay\libmpv-2.dll")) { throw 'libmpv-2.dll is missing' }
+          "EXE=$exe" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Run the installed app, and prove it plays
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing, System.Windows.Forms
+          function Save-Desktop($name) {
+            $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+            $bitmap.Save("$env:EVIDENCE\$name.png", [System.Drawing.Imaging.ImageFormat]::Png)
+            $graphics.Dispose(); $bitmap.Dispose()
+          }
+
+          $log = "$env:EVIDENCE\status.jsonl"
+          $env:JAYPLAY_STATUS_LOG = $log
+          $app = Start-Process -FilePath $env:EXE -ArgumentList "`"$PWD\samples\first.mp4`"" -PassThru
+          Start-Sleep -Seconds 20
+          Save-Desktop 'desktop-playing'
+          if ($app.HasExited) { throw "The app exited with code $($app.ExitCode)" }
+
+          function Read-Status {
+            foreach ($attempt in 1..5) {
+              try { return @(Get-Content $log -ErrorAction Stop | ForEach-Object { $_ | ConvertFrom-Json }) } catch { Start-Sleep -Milliseconds 300 }
+            }
+            throw 'Could not read the status log'
+          }
+          $clock = @(Read-Status | Where-Object { $_.event -eq 'clock' })
+          if ($clock.Count -lt 3) { throw 'The app wrote too few clock lines: playback did not start' }
+          $first = $clock[0].position; $last = $clock[-1].position
+          Write-Host "time-pos went from $first to $last. Frames drawn: $($clock[-1].frames). GL: $($clock[-1].gl). hwdec: $($clock[-1].hwdec)"
+          if ($last -le $first) { throw 'time-pos did not advance' }
+          if ($clock[-1].frames -lt 10) { throw 'The picture is not being drawn' }
+
+          # A second launch hands its file to the first and leaves.
+          $second = Start-Process -FilePath $env:EXE -ArgumentList "`"$PWD\samples\second.mp4`"" -PassThru
+          Start-Sleep -Seconds 8
+          Save-Desktop 'desktop-second-file'
+          if (-not $second.HasExited) { throw 'The second launch kept running' }
+          if ((Get-Process JayPlay).Count -ne 1) { throw 'More than one JayPlay is running' }
+          $titles = @(Read-Status | Where-Object { $_.event -eq 'clock' })[-1]
+          Write-Host "Now playing after the second launch: $($titles.title)"
+          if ($titles.title -notmatch 'second') { throw 'The second file was not passed to the first instance' }
+
+          if ($app.HasExited) { throw 'The app stopped during the test' }
+          $app.CloseMainWindow() | Out-Null
+          Start-Sleep -Seconds 5
+          if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force; Write-Host 'The app needed a forced close.' }
+          Get-Content "$env:APPDATA\JayPlay\library.json" -ErrorAction SilentlyContinue | Out-File "$env:EVIDENCE\library.json"
+
+      - name: Uninstaller works
+        shell: pwsh
+        run: |
+          $uninstaller = Get-ChildItem "$env:LOCALAPPDATA\Programs\JayPlay\unins*.exe" | Select-Object -First 1
+          $proc = Start-Process -FilePath $uninstaller.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+          Write-Host "Uninstaller exit code: $($proc.ExitCode)"
+
+      - name: The engine check must have passed
+        if: steps.engine.outcome == 'failure'
+        run: |
+          echo "The engine check failed. See engine-check.json in the evidence artifact."
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: JayPlay-Setup
+          path: dist/windows/JayPlay-Setup.exe
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: evidence
+          path: evidence
+          if-no-files-found: warn
