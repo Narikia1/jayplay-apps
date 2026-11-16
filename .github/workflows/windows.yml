@@ -84,6 +84,14 @@ jobs:
           ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=640x360:rate=25:duration=60" -f lavfi -i "sine=frequency=550:sample_rate=48000:duration=60" -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest samples\second.mp4
           ffmpeg -hide_banner -loglevel error -y -f lavfi -i "anoisesrc=color=pink:amplitude=0.15:sample_rate=48000:duration=4" -f lavfi -i "anoisesrc=color=white:amplitude=0.05:sample_rate=48000:duration=4" -f lavfi -i "anullsrc=channel_layout=stereo:sample_rate=48000:duration=2" -filter_complex "[0][1]join=inputs=2:channel_layout=stereo[n];[n][2]concat=n=2:v=0:a=1,aloop=loop=1:size=288000[out]" -map "[out]" samples\noise.flac
 
+      - name: Share the samples over SMB, and test network shares against it (docs/network.md)
+        shell: pwsh
+        run: |
+          New-SmbShare -Name JayPlayTest -Path "$PWD\samples" -ReadAccess Everyone | Out-Null
+          $env:JAYPLAY_TEST_UNC_SHARE = 'localhost/JayPlayTest'
+          dotnet test apps/windows/JayPlay.Tests/JayPlay.Tests.csproj -c Release --filter "FullyQualifiedName~NetworkWindowsTests"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: What this libmpv really contains and does (filters, decoders, thumbnails)
         id: engine
         continue-on-error: true
@@ -153,6 +161,27 @@ jobs:
           Start-Sleep -Seconds 5
           if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force; Write-Host 'The app needed a forced close.' }
           Get-Content "$env:APPDATA\JayPlay\library.json" -ErrorAction SilentlyContinue | Out-File "$env:EVIDENCE\library.json"
+
+      - name: The installed app plays a file from the network share
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing, System.Windows.Forms
+          $log = "$env:EVIDENCE\status-share.jsonl"
+          $env:JAYPLAY_STATUS_LOG = $log
+          $app = Start-Process -FilePath $env:EXE -ArgumentList '"\\localhost\JayPlayTest\second.mp4"' -PassThru
+          Start-Sleep -Seconds 20
+          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+          [System.Drawing.Graphics]::FromImage($bitmap).CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+          $bitmap.Save("$env:EVIDENCE\desktop-share.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          if ($app.HasExited) { throw "The app exited with code $($app.ExitCode)" }
+          $clock = @(Get-Content $log | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.event -eq 'clock' })
+          if ($clock.Count -lt 3) { throw 'Playback from the share did not start' }
+          Write-Host "From the share: time-pos went from $($clock[0].position) to $($clock[-1].position), frames $($clock[-1].frames)"
+          if ($clock[-1].position -le $clock[0].position) { throw 'time-pos did not advance' }
+          $app.CloseMainWindow() | Out-Null
+          Start-Sleep -Seconds 5
+          if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
 
       - name: Uninstaller works
         shell: pwsh
